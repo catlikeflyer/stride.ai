@@ -10,6 +10,7 @@ app.use(express.json());
 
 let mcpClient = null;
 let latestTelemetryCache = null;
+let ollamaTools = [];
 
 async function setupMcpClient() {
   const command = process.env.GARMIN_MCP_COMMAND || 'uvx';
@@ -33,6 +34,37 @@ async function setupMcpClient() {
 
     await mcpClient.connect(transport);
     console.log('Connected to Garmin MCP Server');
+
+    // Populate Ollama tools list with a curated selection of core tools to prevent prompt-bloat
+    try {
+      const toolsRes = await mcpClient.listTools();
+      const allowedTools = [
+        'get_stats',
+        'get_user_profile',
+        'get_activities',
+        'get_sleep_data',
+        'get_hrv_data',
+        'get_training_status',
+        'get_vo2max_trend',
+        'get_hrv_trend',
+        'get_training_load_trend',
+        'get_workouts',
+        'schedule_workout'
+      ];
+      ollamaTools = (toolsRes.tools || [])
+        .filter(t => allowedTools.includes(t.name))
+        .map(tool => ({
+          type: 'function',
+          function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.inputSchema
+          }
+        }));
+      console.log(`Successfully mapped ${ollamaTools.length} core Garmin tools for AI usage`);
+    } catch (toolListErr) {
+      console.warn('Failed to fetch tool definitions from Garmin MCP:', toolListErr.message);
+    }
 
     // Warm up the telemetry cache immediately
     await refreshTelemetry();
@@ -162,46 +194,175 @@ app.post('/api/chat', async (req, res) => {
   const ollamaHost = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
 
   // Construct system prompt with Garmin context if available
-  let systemInstructions = 'You are Coach KAI, a premium AI running coach. Be concise, highly professional, encouraging, and focus on physiological optimization. ';
+  let systemInstructions = 'You are Coach KAI, a premium AI running coach. Be concise, highly professional, encouraging, and focus on physiological optimization. ' +
+    'You have access to real-time tools via the Garmin MCP server to check athlete metrics, history, trends, workouts, and sleep. ' +
+    'Always use these tools if the athlete asks about their data, progress, workouts, or performance history. ' +
+    'Do not hallucinate data that requires a tool call.';
+
   if (latestTelemetryCache) {
-    systemInstructions += `\n\nPersonalized Garmin Telemetry Context:
+    systemInstructions += `\n\nPersonalized Garmin Telemetry Context (Static Summary):
 - Athlete: ${latestTelemetryCache.displayName}
 - Today's Date: ${latestTelemetryCache.date}
 - Current Stats: ${latestTelemetryCache.distance} km, ${latestTelemetryCache.steps} steps (Goal: ${latestTelemetryCache.stepGoal})
 - Calories Burned: ${latestTelemetryCache.calories} kcal
 - Resting Heart Rate: ${latestTelemetryCache.restingHr} bpm (Max today: ${latestTelemetryCache.maxHr} bpm)
 - Stress: ${latestTelemetryCache.stressLevel} (${latestTelemetryCache.stressQualifier})
-- Body Battery: Current ${latestTelemetryCache.bodyBatteryCurrent}/100 (Highest: ${latestTelemetryCache.bodyBatteryHighest}, Lowest: ${latestTelemetryCache.bodyBatteryLowest})
+- Body Battery: Current ${latestTelemetryCache.bodyBatteryCurrent}/100
 - Running VO2 Max: ${latestTelemetryCache.vo2max}
-- Pace of Last Run: ${latestTelemetryCache.pace} min/km
-- Recent Sessions:
-${latestTelemetryCache.recentActivities.slice(0, 3).map(a => `  * ${a.name} (${a.type}): ${a.distance} km, ${a.duration} mins, Avg HR: ${a.avgHr} bpm`).join('\n')}`;
+- Pace of Last Run: ${latestTelemetryCache.pace} min/km`;
   }
 
+  const messages = [
+    { role: 'system', content: systemInstructions },
+    { role: 'user', content: message }
+  ];
+
+  const actionsTaken = [];
+  let loopCount = 0;
+  const maxLoops = 6;
+
   try {
-    const response = await fetch(`${ollamaHost}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    // If ollamaTools is empty, try to populate it now
+    if (ollamaTools.length === 0 && mcpClient) {
+      try {
+        const toolsRes = await mcpClient.listTools();
+        ollamaTools = (toolsRes.tools || []).map(tool => ({
+          type: 'function',
+          function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.inputSchema
+          }
+        }));
+      } catch (err) {
+        console.warn('Deferred tool fetching failed:', err.message);
+      }
+    }
+
+    while (loopCount < maxLoops) {
+      loopCount++;
+      console.log(`Agent interaction loop #${loopCount}`);
+
+      const requestBody = {
         model: ollamaModel,
-        messages: [
-          { role: 'system', content: systemInstructions },
-          { role: 'user', content: message }
-        ],
+        messages: messages,
         stream: false
-      })
+      };
+
+      // Only add tools parameter if we successfully loaded tools from the MCP server
+      if (ollamaTools.length > 0) {
+        requestBody.tools = ollamaTools;
+      }
+
+      const response = await fetch(`${ollamaHost}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Ollama returned status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const assistantMessage = data.message;
+
+      // Push response from Ollama to the thread
+      messages.push(assistantMessage);
+
+      // Check for tool calls
+      if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+        console.log(`Model requested tool calls:`, JSON.stringify(assistantMessage.tool_calls));
+        
+        for (const call of assistantMessage.tool_calls) {
+          const toolName = call.function.name;
+          const toolArgs = call.function.arguments;
+          
+          console.log(`Executing tool: ${toolName} with args:`, toolArgs);
+          
+          // Format user-facing action text
+          let actionLabel = `Invoked Garmin tool: ${toolName}`;
+          if (toolName === 'get_stats') {
+            actionLabel = `Checked daily stats for ${toolArgs.date || 'today'}`;
+          } else if (toolName === 'get_activities') {
+            actionLabel = `Fetched recent running logs`;
+          } else if (toolName === 'get_sleep_data') {
+            actionLabel = `Analyzed sleep metrics for ${toolArgs.date || 'last night'}`;
+          } else if (toolName === 'get_hrv_trend') {
+            actionLabel = `Fetched HRV progression trends`;
+          } else if (toolName === 'get_training_status') {
+            actionLabel = `Loaded training status metrics`;
+          } else if (toolName === 'get_vo2max_trend') {
+            actionLabel = `Checked VO2 Max trend`;
+          }
+          actionsTaken.push(actionLabel);
+
+          let resultText = '';
+          try {
+            const toolResult = await mcpClient.callTool({
+              name: toolName,
+              arguments: toolArgs
+            });
+            resultText = toolResult.content.map(c => c.text).join('\n');
+          } catch (toolErr) {
+            console.error(`Error executing tool ${toolName}:`, toolErr.message);
+            resultText = JSON.stringify({ error: toolErr.message });
+          }
+
+          messages.push({
+            role: 'tool',
+            content: resultText,
+            tool_call_id: call.id
+          });
+        }
+        // Proceed with next loop to let Ollama inspect the tool outputs
+      } else {
+        // No tool calls, we have the final assistant message
+        return res.json({
+          response: assistantMessage.content,
+          actions: actionsTaken
+        });
+      }
+    }
+
+    // If we exceed loop count
+    return res.json({
+      response: messages[messages.length - 1].content || "I have gathered the data but need to pause my thinking loop here.",
+      actions: actionsTaken
     });
 
-    if (response.ok) {
-      const data = await response.json();
-      return res.json({ response: data.message.content });
-    } else {
-      throw new Error(`Ollama returned status: ${response.status}`);
-    }
   } catch (err) {
-    console.error('Ollama connection failed, falling back to simulated response.', err.message);
+    console.error('Ollama tool-calling chat failed, falling back.', err.message);
+    
+    // Fallback: If Ollama fails because of the tools parameter, try a standard completion without tools
+    try {
+      const response = await fetch(`${ollamaHost}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: ollamaModel,
+          messages: [
+            { role: 'system', content: systemInstructions },
+            { role: 'user', content: message }
+          ],
+          stream: false
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return res.json({
+          response: data.message.content,
+          actions: ['Garmin Connection Offline - Standard response generated']
+        });
+      }
+    } catch (fallbackErr) {
+      console.error('Fallback failed:', fallbackErr.message);
+    }
+
     res.json({
-      response: `[Simulated Coach KAI Response] I received your message: "${message}". Connect to Ollama with model "${ollamaModel}" to enable real AI coaching responses.`
+      response: `[Simulated Coach KAI Response] I received your message: "${message}". Connect to Ollama with model "${ollamaModel}" to enable real AI coaching responses.`,
+      actions: ['Garmin Connection Offline - Mock response generated']
     });
   }
 });

@@ -76,7 +76,11 @@ function App() {
         body: JSON.stringify({ message: userMessage })
       });
       const data = await res.json();
-      setMessages(prev => [...prev, { role: 'assistant', content: data.response }]);
+      setMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: data.response,
+        actions: data.actions || []
+      }]);
     } catch (err) {
       setMessages(prev => [...prev, { role: 'assistant', content: 'Error connecting to the coaching server.' }]);
     } finally {
@@ -140,7 +144,17 @@ function App() {
                 alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
                 maxWidth: '90%'
               }}>
-                {msg.content}
+                <div>{msg.content}</div>
+                {msg.actions && msg.actions.length > 0 && (
+                  <div className="chat-actions-container">
+                    {msg.actions.map((action, aIdx) => (
+                      <div key={aIdx} className="chat-action-tag">
+                        <span className="action-dot"></span>
+                        <span>{action}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
             {isLoading && (
